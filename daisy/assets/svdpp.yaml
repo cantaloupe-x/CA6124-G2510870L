@@ -1,6 +1,5 @@
-embedding_size: 64
-reg: 0.0001
-max_history_len: 100
-learning_rate: 0.001
-batch_size: 256
-epochs: 1
+factors: 100
+epochs: 20
+lr: 0.01
+reg_1: 0
+reg_2: 0
