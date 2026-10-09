@@ -57,8 +57,8 @@ if __name__ == '__main__':
         train_loader = get_dataloader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4)
         model.fit(train_loader)
 
-    elif config['algo_name'].lower() in ['mf', 'fm', 'neumf', 'nfm', 'ngcf', 'lightgcn']:
-        if config['algo_name'].lower() in ['lightgcn', 'ngcf']:
+    elif config['algo_name'].lower() in ['mf', 'fm', 'neumf', 'nfm', 'ngcf', 'lightgcn', 'svdpp']:
+        if config['algo_name'].lower() in ['lightgcn', 'ngcf', 'svdpp']:
             config['inter_matrix'] = get_inter_matrix(train_set, config)
         model = RecommenderModel(config['algo_name'])(config)
         sampler = BasicNegtiveSampler(train_set, config)
