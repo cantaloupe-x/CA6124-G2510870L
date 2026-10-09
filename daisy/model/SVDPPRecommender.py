@@ -1,468 +1,491 @@
-import math
-from collections import defaultdict
+"""
+SVD++ Recommender for DaisyRec.
 
+Reference
+---------
+Yehuda Koren.
+Factorization Meets the Neighborhood:
+a Multifaceted Collaborative Filtering Model.
+KDD 2008.
+
+This implementation adapts SVD++ to implicit-feedback item ranking
+within DaisyRec. The user representation is enhanced by the implicit
+feedback embeddings of items in the user's training history.
+"""
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .AbstractRecommender import GeneralRecommender
+from daisy.model.AbstractRecommender import GeneralRecommender
 
 
 class SVDPP(GeneralRecommender):
     """
     SVD++ for implicit-feedback item ranking.
 
-    The model extends MF with an implicit-feedback representation built from
-    the user's training history:
-        p_u_tilde = p_u + 1/sqrt(|N(u)|) * sum(y_j)
+    User representation:
+
+        p_u_tilde =
+            p_u + 1 / sqrt(|N(u)|) * sum_{j in N(u)} y_j
+
+    where:
+        p_u : user embedding
+        y_j : implicit-feedback embedding
+        N(u): items interacted with by user u in the training set
     """
 
-    def __init__(self, config, dataset):
-        super().__init__(config, dataset)
+    tunable_param_names = [
+        'num_ng',
+        'factors',
+        'lr',
+        'batch_size',
+        'reg_1',
+        'reg_2'
+    ]
 
-        self.config = config
-        self.dataset = dataset
+    def __init__(self, config):
+        super(SVDPP, self).__init__(config)
 
-        self.n_users = self._read_size(
-            ["n_users", "num_users", "user_num"], default=None
-        )
-        self.n_items = self._read_size(
-            ["n_items", "num_items", "item_num"], default=None
-        )
+        # ------------------------------------------------------------
+        # Basic configuration
+        # ------------------------------------------------------------
+        self.lr = config['lr']
+        self.reg_1 = config['reg_1']
+        self.reg_2 = config['reg_2']
+        self.epochs = config['epochs']
+        self.topk = config['topk']
 
-        if self.n_users is None or self.n_items is None:
-            raise ValueError(
-                "Cannot determine n_users/n_items. "
-                "Follow MFRecommender.py and adapt _read_size()."
-            )
+        self.user_num = config['user_num']
+        self.item_num = config['item_num']
+        self.factors = config['factors']
 
-        self.embedding_size = int(
-            self._get_config(
-                ["embedding_size", "embed_size", "latent_dim"],
-                default=64,
-            )
-        )
-        self.reg = float(
-            self._get_config(
-                ["reg", "reg_weight", "weight_decay"],
-                default=1e-4,
-            )
-        )
-        self.max_history_len = int(
-            self._get_config(
-                ["max_history_len", "history_max_len"],
-                default=100,
-            )
+        self.loss_type = config['loss_type']
+
+        self.optimizer = (
+            config['optimizer']
+            if config['optimizer'] != 'default'
+            else 'adam'
         )
 
-        self.user_embedding = nn.Embedding(
-            self.n_users, self.embedding_size
-        )
-        self.item_embedding = nn.Embedding(
-            self.n_items, self.embedding_size
-        )
-        self.implicit_embedding = nn.Embedding(
-            self.n_items, self.embedding_size
+        self.initializer = (
+            config['init_method']
+            if config['init_method'] != 'default'
+            else 'normal'
         )
 
-        self.user_bias = nn.Embedding(self.n_users, 1)
-        self.item_bias = nn.Embedding(self.n_items, 1)
+        self.early_stop = config['early_stop']
 
-        self.global_bias = nn.Parameter(torch.zeros(1))
+        # ------------------------------------------------------------
+        # Training interaction matrix
+        #
+        # DaisyRec already provides this in config. It must contain
+        # TRAINING interactions only.
+        # ------------------------------------------------------------
+        self.interaction_matrix = config['inter_matrix']
 
-        nn.init.normal_(self.user_embedding.weight, std=0.01)
-        nn.init.normal_(self.item_embedding.weight, std=0.01)
-        nn.init.normal_(self.implicit_embedding.weight, std=0.01)
-        nn.init.zeros_(self.user_bias.weight)
-        nn.init.zeros_(self.item_bias.weight)
+        # ------------------------------------------------------------
+        # SVD++ embeddings
+        # ------------------------------------------------------------
 
-        history_items, history_mask = self._build_histories(dataset)
+        # p_u
+        self.embed_user = nn.Embedding(
+            self.user_num,
+            self.factors
+        )
+
+        # q_i
+        self.embed_item = nn.Embedding(
+            self.item_num,
+            self.factors
+        )
+
+        # y_j: implicit-feedback item embeddings
+        self.embed_implicit = nn.Embedding(
+            self.item_num,
+            self.factors
+        )
+
+        # Initialize embeddings using DaisyRec's initialization method.
+        self.apply(self._init_weight)
+
+        # ------------------------------------------------------------
+        # Build user history from training interaction matrix.
+        # ------------------------------------------------------------
+        history_items, history_mask = self._build_user_history()
+
+        # Buffers move automatically with model.to(device), but are not
+        # trainable parameters.
+        self.register_buffer(
+            'history_items',
+            history_items
+        )
 
         self.register_buffer(
-            "history_items",
-            history_items,
-            persistent=False,
-        )
-        self.register_buffer(
-            "history_mask",
-            history_mask,
-            persistent=False,
+            'history_mask',
+            history_mask
         )
 
-    def _get_config(self, names, default=None):
-        for name in names:
-            if isinstance(self.config, dict) and name in self.config:
-                return self.config[name]
-
-            if hasattr(self.config, name):
-                return getattr(self.config, name)
-
-            try:
-                value = self.config[name]
-                if value is not None:
-                    return value
-            except Exception:
-                pass
-
-        return default
-
-    def _read_size(self, names, default=None):
-        for name in names:
-            if hasattr(self, name):
-                value = getattr(self, name)
-                if value is not None:
-                    return int(value)
-
-            if hasattr(self.dataset, name):
-                value = getattr(self.dataset, name)
-                if value is not None:
-                    return int(value)
-
-        return default
-
-    def _extract_training_interactions(self, dataset):
+    def _build_user_history(self):
         """
-        Try common DaisyRec dataset attributes.
+        Construct a padded training-history matrix.
 
-        Return:
-            users: list[int]
-            items: list[int]
+        history_items[u]:
+            item IDs interacted with by user u in the training set.
+
+        history_mask[u]:
+            1 for a real history item, 0 for padding.
+
+        Important:
+            Only config['inter_matrix'] is used here, so validation/test
+            interactions must NOT be included in inter_matrix.
         """
-        candidates = [
-            "train_data",
-            "train_interactions",
-            "interactions",
-            "inter_feat",
-            "train_feat",
-        ]
 
-        data = None
-        for name in candidates:
-            if hasattr(dataset, name):
-                data = getattr(dataset, name)
-                if data is not None:
-                    break
+        inter_matrix = self.interaction_matrix.tocoo()
 
-        if data is None:
-            raise ValueError(
-                "Cannot find training interactions on dataset. "
-                "Expose a training interaction table as dataset.train_data "
-                "or adapt _extract_training_interactions()."
-            )
+        histories = [[] for _ in range(self.user_num)]
 
-        # pandas DataFrame
-        if hasattr(data, "columns") and hasattr(data, "__getitem__"):
-            columns = set(str(c) for c in data.columns)
+        for user, item in zip(
+            inter_matrix.row,
+            inter_matrix.col
+        ):
+            user = int(user)
+            item = int(item)
 
-            user_col = next(
-                (
-                    c
-                    for c in ["user", "user_id", "uid"]
-                    if c in columns
-                ),
-                None,
-            )
-            item_col = next(
-                (
-                    c
-                    for c in ["item", "item_id", "iid"]
-                    if c in columns
-                ),
-                None,
-            )
+            if (
+                0 <= user < self.user_num
+                and 0 <= item < self.item_num
+            ):
+                histories[user].append(item)
 
-            if user_col is None or item_col is None:
-                raise ValueError(
-                    "Training DataFrame must contain user/item columns."
-                )
-
-            return (
-                data[user_col].astype(int).tolist(),
-                data[item_col].astype(int).tolist(),
-            )
-
-        # dictionary-like interaction table
-        if isinstance(data, dict):
-            user_key = next(
-                (
-                    k
-                    for k in ["user", "user_id", "uid"]
-                    if k in data
-                ),
-                None,
-            )
-            item_key = next(
-                (
-                    k
-                    for k in ["item", "item_id", "iid"]
-                    if k in data
-                ),
-                None,
-            )
-
-            if user_key is None or item_key is None:
-                raise ValueError(
-                    "Training interaction dictionary must contain "
-                    "user and item fields."
-                )
-
-            return (
-                [int(x) for x in data[user_key]],
-                [int(x) for x in data[item_key]],
-            )
-
-        # list of tuples: (user, item, ...)
-        if isinstance(data, (list, tuple)):
-            users = []
-            items = []
-
-            for row in data:
-                if isinstance(row, dict):
-                    user = row.get("user", row.get("user_id"))
-                    item = row.get("item", row.get("item_id"))
-                else:
-                    user, item = row[0], row[1]
-
-                users.append(int(user))
-                items.append(int(item))
-
-            return users, items
-
-        raise ValueError(
-            "Unsupported training interaction type. "
-            "Adapt _extract_training_interactions()."
+        max_history_len = max(
+            (len(items) for items in histories),
+            default=1
         )
 
-    def _build_histories(self, dataset):
-        users, items = self._extract_training_interactions(dataset)
-
-        histories = defaultdict(list)
-
-        for user, item in zip(users, items):
-            if user < 0 or user >= self.n_users:
-                continue
-            if item < 0 or item >= self.n_items:
-                continue
-
-            histories[user].append(item)
+        # Avoid a zero-width tensor.
+        max_history_len = max(max_history_len, 1)
 
         history_items = torch.zeros(
-            (self.n_users, self.max_history_len),
-            dtype=torch.long,
+            (self.user_num, max_history_len),
+            dtype=torch.long
         )
+
         history_mask = torch.zeros(
-            (self.n_users, self.max_history_len),
-            dtype=torch.float32,
+            (self.user_num, max_history_len),
+            dtype=torch.float32
         )
 
-        for user in range(self.n_users):
-            user_items = histories[user]
+        for user, items in enumerate(histories):
 
-            if len(user_items) > self.max_history_len:
-                user_items = user_items[-self.max_history_len :]
-
-            if len(user_items) == 0:
+            if len(items) == 0:
                 continue
 
-            length = len(user_items)
-            history_items[user, :length] = torch.tensor(
-                user_items,
-                dtype=torch.long,
+            length = len(items)
+
+            history_items[
+                user,
+                :length
+            ] = torch.tensor(
+                items,
+                dtype=torch.long
             )
-            history_mask[user, :length] = 1.0
+
+            history_mask[
+                user,
+                :length
+            ] = 1.0
 
         return history_items, history_mask
 
-    def _user_vector(
-        self,
-        users,
-        histories=None,
-        history_mask=None,
-    ):
-        if histories is None:
-            histories = self.history_items[users]
-
-        if history_mask is None:
-            history_mask = self.history_mask[users]
-
-        base_user = self.user_embedding(users)
-
-        history_vectors = self.implicit_embedding(histories)
-        history_vectors = history_vectors * history_mask.unsqueeze(-1)
-
-        summed_history = history_vectors.sum(dim=1)
-        history_length = history_mask.sum(dim=1).clamp_min(1.0)
-
-        return base_user + summed_history / torch.sqrt(
-            history_length
-        ).unsqueeze(-1)
-
-    def forward(
-        self,
-        users,
-        items,
-        histories=None,
-        history_mask=None,
-    ):
-        users = users.long()
-        items = items.long()
-
-        user_vector = self._user_vector(
-            users,
-            histories=histories,
-            history_mask=history_mask,
-        )
-        item_vector = self.item_embedding(items)
-
-        score = (user_vector * item_vector).sum(dim=-1)
-
-        score = score + self.user_bias(users).squeeze(-1)
-        score = score + self.item_bias(items).squeeze(-1)
-        score = score + self.global_bias
-
-        return score
-
-    def _parse_interaction(self, interaction):
-        if isinstance(interaction, dict):
-            users = interaction.get(
-                "user",
-                interaction.get("users", interaction.get("uid")),
-            )
-            positive_items = interaction.get(
-                "item",
-                interaction.get(
-                    "items",
-                    interaction.get("positive_item"),
-                ),
-            )
-            negative_items = interaction.get(
-                "neg_item",
-                interaction.get(
-                    "negative_item",
-                    interaction.get("neg_items"),
-                ),
-            )
-            histories = interaction.get(
-                "history",
-                interaction.get("histories"),
-            )
-            history_mask = interaction.get(
-                "history_mask",
-                interaction.get("mask"),
-            )
-
-            if users is None or positive_items is None:
-                raise ValueError(
-                    "Interaction dictionary does not contain user/item."
-                )
-
-            return (
-                users,
-                positive_items,
-                negative_items,
-                histories,
-                history_mask,
-            )
-
-        if isinstance(interaction, (tuple, list)):
-            if len(interaction) < 3:
-                raise ValueError(
-                    "SVD++ BPR interaction requires at least "
-                    "(users, positive_items, negative_items)."
-                )
-
-            users = interaction[0]
-            positive_items = interaction[1]
-            negative_items = interaction[2]
-
-            histories = interaction[3] if len(interaction) > 3 else None
-            history_mask = interaction[4] if len(interaction) > 4 else None
-
-            return (
-                users,
-                positive_items,
-                negative_items,
-                histories,
-                history_mask,
-            )
-
-        raise ValueError("Unsupported interaction batch format.")
-
-    def calc_loss(self, interaction):
-        (
-            users,
-            positive_items,
-            negative_items,
-            histories,
-            history_mask,
-        ) = self._parse_interaction(interaction)
-
-        users = users.long()
-        positive_items = positive_items.long()
-        negative_items = negative_items.long()
-
-        positive_scores = self.forward(
-            users,
-            positive_items,
-            histories=histories,
-            history_mask=history_mask,
-        )
-        negative_scores = self.forward(
-            users,
-            negative_items,
-            histories=histories,
-            history_mask=history_mask,
-        )
-
-        bpr_loss = -F.logsigmoid(
-            positive_scores - negative_scores
-        ).mean()
-
-        user_vectors = self.user_embedding(users)
-        positive_vectors = self.item_embedding(positive_items)
-        negative_vectors = self.item_embedding(negative_items)
-
-        regularization = (
-            user_vectors.pow(2).mean()
-            + positive_vectors.pow(2).mean()
-            + negative_vectors.pow(2).mean()
-        )
-
-        return bpr_loss + self.reg * regularization
-
-    def rank(self, users, items=None):
+    def get_user_embedding(self, user):
         """
-        Return scores for evaluation.
+        Compute the SVD++ enhanced user representation:
 
-        If items is None, score every item. Otherwise score the supplied
-        candidate items. The surrounding DaisyRec evaluation code should
-        perform Top-K selection in the same way as MF.
+            p_u +
+            1/sqrt(|N(u)|) * sum(y_j)
         """
-        users = users.long()
 
-        if items is None:
-            items = torch.arange(
-                self.n_items,
-                device=users.device,
-                dtype=torch.long,
+        user = user.long()
+
+        # Base user embedding p_u
+        base_user_embedding = self.embed_user(user)
+
+        # Get this batch's training histories.
+        histories = self.history_items[user]
+        masks = self.history_mask[user]
+
+        # batch_size x history_length x factors
+        implicit_embeddings = self.embed_implicit(histories)
+
+        # Remove padding positions.
+        implicit_embeddings = (
+            implicit_embeddings
+            * masks.unsqueeze(-1)
+        )
+
+        # Sum y_j over N(u).
+        implicit_sum = implicit_embeddings.sum(dim=1)
+
+        # |N(u)|
+        history_length = masks.sum(dim=1)
+
+        # Avoid division by zero.
+        history_length = history_length.clamp_min(1.0)
+
+        normalized_implicit = (
+            implicit_sum
+            / torch.sqrt(history_length).unsqueeze(-1)
+        )
+
+        return (
+            base_user_embedding
+            + normalized_implicit
+        )
+
+    def forward(self, user, item):
+        """
+        Predict preference score for user-item pairs.
+        """
+
+        user = user.long()
+        item = item.long()
+
+        user_embedding = self.get_user_embedding(user)
+        item_embedding = self.embed_item(item)
+
+        pred = (
+            user_embedding
+            * item_embedding
+        ).sum(dim=-1)
+
+        return pred
+
+    def calc_loss(self, batch):
+        """
+        Calculate ranking loss.
+
+        DaisyRec BPR-style batch:
+            batch[0] = user
+            batch[1] = positive item
+            batch[2] = negative item
+        """
+
+        user = batch[0].to(self.device).long()
+        pos_item = batch[1].to(self.device).long()
+
+        pos_pred = self.forward(
+            user,
+            pos_item
+        )
+
+        # ------------------------------------------------------------
+        # Point-wise losses
+        # ------------------------------------------------------------
+        if self.loss_type.upper() in ['CL', 'SL']:
+
+            label = batch[2].to(
+                self.device
+            ).float()
+
+            loss = self.criterion(
+                pos_pred,
+                label
             )
-            items = items.unsqueeze(0).expand(
-                users.shape[0],
-                -1,
+
+            loss += self.reg_1 * (
+                self.embed_user(user).norm(p=1)
+                + self.embed_item(pos_item).norm(p=1)
             )
+
+            loss += self.reg_2 * (
+                self.embed_user(user).norm()
+                + self.embed_item(pos_item).norm()
+            )
+
+        # ------------------------------------------------------------
+        # Pair-wise ranking losses
+        # BPR / TOP1 / Hinge
+        # ------------------------------------------------------------
+        elif self.loss_type.upper() in [
+            'BPR',
+            'TL',
+            'HL'
+        ]:
+
+            neg_item = batch[2].to(
+                self.device
+            ).long()
+
+            neg_pred = self.forward(
+                user,
+                neg_item
+            )
+
+            loss = self.criterion(
+                pos_pred,
+                neg_pred
+            )
+
+            # Regularize base user and target item embeddings.
+            loss += self.reg_1 * (
+                self.embed_user(user).norm(p=1)
+                + self.embed_item(pos_item).norm(p=1)
+                + self.embed_item(neg_item).norm(p=1)
+            )
+
+            loss += self.reg_2 * (
+                self.embed_user(user).norm()
+                + self.embed_item(pos_item).norm()
+                + self.embed_item(neg_item).norm()
+            )
+
         else:
-            items = items.long()
-
-        if items.dim() == 1:
-            items = items.unsqueeze(0).expand(
-                users.shape[0],
-                -1,
+            raise NotImplementedError(
+                f'Invalid loss type: {self.loss_type}'
             )
 
-        expanded_users = users.unsqueeze(1).expand_as(items)
+        # ------------------------------------------------------------
+        # Regularize implicit-feedback embeddings y_j.
+        #
+        # Only embeddings actually used by users in this batch are
+        # regularized.
+        # ------------------------------------------------------------
+        batch_history = self.history_items[user]
+        batch_mask = self.history_mask[user]
 
-        flat_users = expanded_users.reshape(-1)
-        flat_items = items.reshape(-1)
+        implicit_embeddings = self.embed_implicit(
+            batch_history
+        )
 
-        scores = self.forward(flat_users, flat_items)
-        return scores.reshape(items.shape)
+        # Padding positions should not contribute.
+        implicit_embeddings = (
+            implicit_embeddings
+            * batch_mask.unsqueeze(-1)
+        )
+
+        loss += self.reg_1 * (
+            implicit_embeddings.norm(p=1)
+        )
+
+        loss += self.reg_2 * (
+            implicit_embeddings.norm()
+        )
+
+        return loss
+
+    def predict(self, u, i):
+        """
+        Predict one user-item preference score.
+        """
+
+        u = torch.tensor(
+            u,
+            device=self.device,
+            dtype=torch.long
+        )
+
+        i = torch.tensor(
+            i,
+            device=self.device,
+            dtype=torch.long
+        )
+
+        pred = self.forward(
+            u,
+            i
+        ).cpu().item()
+
+        return pred
+
+    def rank(self, test_loader):
+        """
+        Rank candidate items for every user.
+
+        This follows the same DaisyRec interface as MF.rank().
+        """
+
+        rec_ids = []
+
+        for us, cands_ids in test_loader:
+
+            us = us.to(
+                self.device
+            ).long()
+
+            cands_ids = cands_ids.to(
+                self.device
+            ).long()
+
+            # batch x factors
+            user_emb = self.get_user_embedding(us)
+
+            # batch x candidate_num x factors
+            item_emb = self.embed_item(
+                cands_ids
+            )
+
+            # batch x candidate_num
+            scores = torch.bmm(
+                user_emb.unsqueeze(1),
+                item_emb.transpose(1, 2)
+            ).squeeze(1)
+
+            rank_ids = torch.argsort(
+                scores,
+                descending=True,
+                dim=1
+            )
+
+            rank_list = torch.gather(
+                cands_ids,
+                1,
+                rank_ids
+            )
+
+            rank_list = rank_list[
+                :,
+                :self.topk
+            ]
+
+            rec_ids.append(rank_list)
+
+        if len(rec_ids) == 0:
+            return np.empty(
+                (0, self.topk),
+                dtype=np.int64
+            )
+
+        rec_ids = torch.cat(
+            rec_ids,
+            dim=0
+        )
+
+        return rec_ids.cpu().numpy()
+
+    def full_rank(self, u):
+        """
+        Rank all items for one user.
+        """
+
+        u = torch.tensor(
+            [u],
+            device=self.device,
+            dtype=torch.long
+        )
+
+        user_emb = self.get_user_embedding(
+            u
+        ).squeeze(0)
+
+        items_emb = self.embed_item.weight
+
+        scores = torch.matmul(
+            user_emb,
+            items_emb.transpose(1, 0)
+        )
+
+        return torch.argsort(
+            scores,
+            descending=True
+        )[:self.topk].cpu().numpy()
