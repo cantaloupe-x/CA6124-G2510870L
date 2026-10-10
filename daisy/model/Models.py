@@ -44,6 +44,9 @@ def RecommenderModel(algo_name: str) -> GeneralRecommender:
     elif algo_name == 'lightgcn':
         from .LightGCNRecommender import LightGCN
         return LightGCN
+    elif algo_name == 'svdpp':
+        from .SVDPPRecommender import SVDPP
+        return SVDPP
     else:
         raise ModuleNotFoundError(f"Model name '{algo_name}' not found")
 
