@@ -89,6 +89,10 @@ if __name__ == '__main__':
             train_ur = get_ur(train)
             config['train_ur'] = train_ur
 
+            ''' build interaction matrix before model initialization '''
+            if config['algo_name'].lower() in ['lightgcn', 'ngcf', 'svdpp']:
+                config['inter_matrix'] = get_inter_matrix(train, config)
+
             ''' build and train model '''
             model = RecommenderModel(config['algo_name'])(config)
             if config['algo_name'].lower() in ['itemknn', 'puresvd', 'slim', 'mostpop', 'ease']:
@@ -102,8 +106,6 @@ if __name__ == '__main__':
                 model.fit(train_loader)
 
             elif config['algo_name'].lower() in ['mf', 'fm', 'neumf', 'nfm', 'ngcf', 'lightgcn', 'svdpp']:
-                if config['algo_name'].lower() in ['lightgcn', 'ngcf', 'svdpp']:
-                    config['inter_matrix'] = get_inter_matrix(train, config)
                 sampler = BasicNegtiveSampler(train, config)
                 train_samples = sampler.sampling()
                 train_dataset = BasicDataset(train_samples)

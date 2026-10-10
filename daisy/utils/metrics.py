@@ -155,7 +155,7 @@ def MAP(test_ur, pred_ur, test_u):
 
 def NDCG(test_ur, pred_ur, test_u):
     def DCG(r):
-        r = np.asfarray(r) != 0
+        r = np.asarray(r, dtype=float) != 0
         if r.size:
             dcg = np.sum(np.subtract(np.power(2, r), 1) /
                          np.log2(np.arange(2, r.size + 2)))
